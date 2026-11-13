@@ -15,7 +15,7 @@ An accessible teaching workspace that turns spoken explanations, lecture materia
 
 ---
 
-> **You're on the `demo` branch.** This is the keyless interactive demo: the full UI running entirely in the browser, with sample content and simulated AI. The real app lives on `main`. See [docs/DEMO.md](docs/DEMO.md).
+> **This is the interactive demo.** The full UI runs entirely in the browser, with sample content and simulated AI, and no backend or keys. The real app is [stephen-m-g/aside](https://github.com/stephen-m-g/aside). See [docs/DEMO.md](docs/DEMO.md).
 
 
 ## Demo

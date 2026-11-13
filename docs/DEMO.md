@@ -1,14 +1,14 @@
-# Demo build (`demo` branch)
+# Demo build
 
-The `demo` branch is the public, keyless version of aside: the full web UI with no backend. It's built to be deployed as a static site (Vercel) that anyone can click through, without exposing the Supabase project, the FastAPI server or any API keys.
+This repo ([stephen-m-g/aside-demo](https://github.com/stephen-m-g/aside-demo)) is the public, keyless version of aside: the full web UI with no backend. It's built to be deployed as a static site (Vercel) that anyone can click through, without exposing the Supabase project, the FastAPI server or any API keys.
 
-`main` stays the real app. Nothing on this branch talks to a server.
+The real app is the hackathon repo, [stephen-m-g/aside](https://github.com/stephen-m-g/aside), which this one is forked from. Nothing here talks to a server.
 
-## What's different from `main`
+## What's different from the real app
 
-Only five app files change; every other screen and component is the same code as `main`.
+Only five app files change; every other screen and component is the same code as the hackathon repo.
 
-| File | On `main` | On `demo` |
+| File | Real app | Demo |
 |---|---|---|
 | `web/src/lib/supabase.ts` | Supabase client from env vars | In-browser stand-in (`src/demo/db.ts`), typed as the real client |
 | `web/src/lib/api.ts` | `fetch` to the FastAPI server | Same functions, run in the browser (`src/demo/ai.ts`) |
@@ -40,16 +40,24 @@ No `.env.local` is needed (any that exists is ignored).
 
 - **Root Directory:** `web`
 - **Framework preset:** Vite (build `npm run build`, output `dist`)
-- **Production branch:** `demo`
+- **Production branch:** `main`
 - **Environment variables:** none. Remove any `VITE_SUPABASE_*` / `VITE_API_URL` from the project.
 
 `web/vercel.json` already rewrites every path to `index.html` for client-side routing.
 
-## Keeping it up to date with `main`
+## Updating
+
+Locally, this repo is the `demo` branch of the hackathon checkout, with this repo as the `demo-origin` remote. Pushing redeploys the site:
 
 ```bash
 git switch demo
+git push demo-origin demo:main
+```
+
+To bring in new work from the real app first:
+
+```bash
 git merge main
 ```
 
-Conflicts can only happen in the files in the table above. Keep the demo version of the first four; in `Dashboard.tsx` take `main`'s changes and keep the `demo-brand` wrapper and `#demo-badge-slot` around the logo. If `main` starts using a new Supabase feature (a new table, filter or column), add it to `src/demo/db.ts` (`TABLES`, `FKS`) and the seed.
+Conflicts can only happen in the files in the table above. Keep the demo version of the first four; in `Dashboard.tsx` take the real app's changes and keep the `demo-brand` wrapper and `#demo-badge-slot` around the logo. If the real app starts using a new Supabase feature (a new table, filter or column), add it to `src/demo/db.ts` (`TABLES`, `FKS`) and the seed.
