@@ -1,86 +1,64 @@
-// P3 owns this hook. ElevenLabs Scribe v2 Realtime is the only speech-to-text engine; it feeds
-// final utterances to the segment pipeline through onFinal.
-import { CommitStrategy, RealtimeEvents, useScribe, type UseScribeReturn, type WordTimestamp } from '@elevenlabs/react'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { ApiError, api } from '../lib/api'
-import {
-  SCRIBE_MODEL_ID,
-  ScribeUtteranceBuffer,
-  TimestampedCommitQueue,
-  classifyTokenError,
-  describeMicrophoneError,
-  describeScribeError,
-  parseKeyterms,
-  partitionTimestampedTranscript,
-  type AnnotationCaptureInterval,
-  type ScribeErrorKind,
-  type ScribeFailure,
-} from './scribeModel'
+// Demo build: replaces the ElevenLabs Scribe hook (which needs a server-minted token) with a keyless voice.
+// Same options and return shape, so the Teach page is unchanged. The voice is picked in the demo bar:
+//  - 'script' speaks a sample lecture word by word (interim text, then a committed utterance);
+//  - 'mic' uses the browser's built-in speech recognition (webkitSpeechRecognition).
+// Final utterances go through the same partitioning as the real hook, so smart annotations and PDF pages
+// capture speech exactly as they do in the full app.
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { getData } from '../demo/db'
+import { annotationLine, scriptFor } from '../demo/scripts'
+import { micSupported, useVoiceMode } from '../demo/voice'
+import { partitionTimestampedTranscript, type AnnotationCaptureInterval } from './scribeModel'
 import {
   calculateSpeechMetrics,
   countWords,
-  getRestartDelay,
   type SpeechMetrics,
   type SpeechSample,
   type TranscriptionContext,
   type TranscriptionResultHandler,
 } from './transcriptionModel'
 
-const KEYTERMS = parseKeyterms(import.meta.env.VITE_ELEVENLABS_KEYTERMS)
-const MICROPHONE = { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-/** How long an intentional stop waits for the server to commit the segment being spoken. */
-const STOP_FLUSH_TIMEOUT_MS = 1_500
-
 const EMPTY_METRICS: SpeechMetrics = { rollingWpm: null, averageConfidence: null, baselineWpm: null }
+const WORD_MS = 290
+const PAUSE_MS = 1_400
 
-interface UtteranceCapture {
+export interface UseScribeTranscriptionOptions {
+  enabled: boolean
+  sessionId: string
   onFinal: TranscriptionResultHandler
+  captureContext?: () => TranscriptionContext
+  captureAnnotationIntervals?: () => AnnotationCaptureInterval[]
+  capturePageAt?: (ms: number) => string | null | undefined
+  scopeKey?: string
+}
+
+interface Capture {
   context: TranscriptionContext | null
   startedAt: string
 }
 
-interface Attempt {
-  generation: number
-  buffer: ScribeUtteranceBuffer<UtteranceCapture>
-  pendingCommits: TimestampedCommitQueue<{ capture: UtteranceCapture; text: string }>
-  /** Wall-clock time of the first microphone audio frame; Scribe word times use this cumulative audio clock. */
-  audioStartedAt: number | null
-  detachAudioStarted: (() => void) | null
-  /** scribe.connect() was called, so a close event belongs to this attempt. */
-  connected: boolean
-  stopping: Promise<void> | null
-  failure: ScribeFailure | null
-  onCommit: (() => void) | null
+// Minimal typing for the browser's speech recognition.
+interface RecognitionResult {
+  isFinal: boolean
+  0: { transcript: string; confidence: number }
+}
+interface Recognition {
+  continuous: boolean
+  interimResults: boolean
+  lang: string
+  onresult: ((e: { resultIndex: number; results: ArrayLike<RecognitionResult> }) => void) | null
+  onerror: ((e: { error: string }) => void) | null
+  onend: (() => void) | null
+  onstart: (() => void) | null
+  start(): void
+  stop(): void
+  abort(): void
 }
 
-export interface UseScribeTranscriptionOptions {
-  enabled: boolean
-  /** Live session the API mints the single-use token for. */
-  sessionId: string
-  onFinal: TranscriptionResultHandler
-  /** Snapshot v2 session/annotation ownership when an utterance first appears. */
-  captureContext?: () => TranscriptionContext
-  /** Current persisted/optimistic Smart-circle intervals, read when delayed word timings arrive. */
-  captureAnnotationIntervals?: () => AnnotationCaptureInterval[]
-  /** The PDF page active at a wall-clock time (undefined = unknown: the page captured at speech start applies). */
-  capturePageAt?: (ms: number) => string | null | undefined
-  /** Invalidates callbacks and metrics when the active session changes. */
-  scopeKey?: string
-}
-
-function isSupported(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof WebSocket !== 'undefined' &&
-    typeof AudioWorkletNode !== 'undefined' &&
-    typeof navigator.mediaDevices?.getUserMedia === 'function'
-  )
-}
-
-/** Surfaces permission errors with their DOMException name; the SDK only reports a message. */
-async function preflightMicrophone(): Promise<void> {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-  for (const track of stream.getTracks()) track.stop()
+function createRecognition(): Recognition | null {
+  const w = window as unknown as { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition }
+  const Ctor = w.SpeechRecognition ?? w.webkitSpeechRecognition
+  return Ctor ? new Ctor() : null
 }
 
 export function useScribeTranscription({
@@ -92,390 +70,232 @@ export function useScribeTranscription({
   capturePageAt,
   scopeKey,
 }: UseScribeTranscriptionOptions) {
+  const mode = useVoiceMode()
   const [interim, setInterim] = useState('')
   const [listening, setListening] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [metrics, setMetrics] = useState<SpeechMetrics>(EMPTY_METRICS)
-  const supported = isSupported()
 
-  const onFinalRef = useRef(onFinal)
-  const captureContextRef = useRef(captureContext)
-  const captureAnnotationIntervalsRef = useRef(captureAnnotationIntervals)
-  const capturePageAtRef = useRef(capturePageAt)
-  const sessionIdRef = useRef(sessionId)
-  const enabledRef = useRef(enabled)
-  const generationRef = useRef(0)
-  const attemptRef = useRef<Attempt | null>(null)
-  const shouldListenRef = useRef(false)
-  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const retriesRef = useRef(0)
-  const samplesRef = useRef<SpeechSample[]>([])
-  const metricsStartedAtRef = useRef<number | null>(null)
-  const scribeRef = useRef<UseScribeReturn | null>(null)
-
-  onFinalRef.current = onFinal
-  captureContextRef.current = captureContext
-  captureAnnotationIntervalsRef.current = captureAnnotationIntervals
-  capturePageAtRef.current = capturePageAt
-  sessionIdRef.current = sessionId
-  enabledRef.current = enabled
+  const opts = useRef({ onFinal, captureContext, captureAnnotationIntervals, capturePageAt, sessionId })
+  opts.current = { onFinal, captureContext, captureAnnotationIntervals, capturePageAt, sessionId }
+  const samples = useRef<SpeechSample[]>([])
+  const startedAt = useRef<number | null>(null)
+  /** Live voice: commit what's been said so far (used by Smart ✓ and stop). */
+  const flushRef = useRef<() => void>(() => {})
+  const stopRef = useRef<() => void>(() => {})
 
   const refreshMetrics = useCallback((now = Date.now()) => {
-    setMetrics(calculateSpeechMetrics(samplesRef.current, now, metricsStartedAtRef.current))
+    setMetrics(calculateSpeechMetrics(samples.current, now, startedAt.current))
   }, [])
 
-  // Everything below reads refs only, so closures from any render behave the same.
-  const isLive = (attempt: Attempt) => attemptRef.current === attempt && attempt.generation === generationRef.current
-
-  const capture = (): UtteranceCapture => ({
-    onFinal: onFinalRef.current,
-    context: captureContextRef.current?.() ?? null,
-    startedAt: new Date().toISOString(),
-  })
-
-  const save = (
-    captured: UtteranceCapture,
-    text: string,
-    tStart: string,
-    tEnd: string,
-    annotationId: string | null,
-    pageBlockId: string | null,
-  ) => {
-    const completedAt = Date.now()
-    const context = captured.context ? { ...captured.context, annotationId, pageBlockId } : null
-    captured.onFinal(text, null, tStart, tEnd, context)
-    samplesRef.current = [...samplesRef.current, { completedAt, wordCount: countWords(text), confidence: null }]
-    refreshMetrics(completedAt)
-  }
-
-  const saveParts = (captured: UtteranceCapture, text: string, words: WordTimestamp[] | undefined) => {
-    const endedAt = new Date().toISOString()
-    const intervals = captureAnnotationIntervalsRef.current?.() ?? []
-    const pageAt = capturePageAtRef.current
-    const parts = partitionTimestampedTranscript(
-      text,
-      words,
-      attemptRef.current?.audioStartedAt ?? null,
-      captured.startedAt,
-      endedAt,
-      intervals,
-      { at: (ms) => pageAt?.(ms), fallback: captured.context?.pageBlockId ?? null },
-    )
-    for (const part of parts) save(captured, part.text, part.tStart, part.tEnd, part.annotationId, part.pageBlockId)
-  }
-
-  const saveFallback = ({ capture: captured, text }: { capture: UtteranceCapture; text: string }) =>
-    saveParts(captured, text, undefined)
-
-  const clearRetry = () => {
-    if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
-    retryTimerRef.current = null
-  }
-
-  /** Closes the attempt. `flush` saves an uncommitted partial instead of dropping it. */
-  const endAttempt = (attempt: Attempt, flush: boolean) => {
-    if (attemptRef.current !== attempt) return
-    if (flush && attempt.generation === generationRef.current) {
-      const leftover = attempt.buffer.flushPartial()
-      if (leftover) saveFallback(leftover)
-      for (const pending of attempt.pendingCommits.drain()) {
-        saveFallback(pending)
-      }
-    }
-    attempt.detachAudioStarted?.()
-    attemptRef.current = null
-    attempt.onCommit?.()
-    scribeRef.current?.disconnect()
-    setListening(false)
-    setInterim('')
-  }
-
-  const scheduleReconnect = (generation: number) => {
-    if (!shouldListenRef.current || retryTimerRef.current || generationRef.current !== generation) return
-    const delay = getRestartDelay(retriesRef.current)
-    if (delay === null) {
-      shouldListenRef.current = false
-      setError('ElevenLabs disconnected repeatedly. Turn the microphone off and on to retry.')
-      return
-    }
-    retriesRef.current += 1
-    retryTimerRef.current = setTimeout(() => {
-      retryTimerRef.current = null
-      if (shouldListenRef.current && generationRef.current === generation && !attemptRef.current) void begin(generation)
-    }, delay)
-  }
-
-  const begin = async (generation: number) => {
-    const attempt: Attempt = {
-      generation,
-      buffer: new ScribeUtteranceBuffer<UtteranceCapture>(),
-      pendingCommits: new TimestampedCommitQueue<{ capture: UtteranceCapture; text: string }>(),
-      audioStartedAt: null,
-      detachAudioStarted: null,
-      connected: false,
-      stopping: null,
-      failure: null,
-      onCommit: null,
-    }
-    attemptRef.current = attempt
-    const failed = (failure: ScribeFailure) => {
-      if (!isLive(attempt)) return
-      attemptRef.current = null
-      setError(failure.message)
-      if (failure.fatal) shouldListenRef.current = false
-      else scheduleReconnect(generation)
-    }
-
-    try {
-      await preflightMicrophone()
-    } catch (micError) {
-      failed(describeMicrophoneError(micError))
-      return
-    }
-    if (!isLive(attempt)) return
-
-    let token: string
-    try {
-      token = (await api.scribeToken(sessionIdRef.current)).token
-    } catch (tokenError) {
-      console.warn('scribe token failed', tokenError)
-      failed(classifyTokenError(tokenError instanceof ApiError ? tokenError.status : undefined))
-      return
-    }
-    if (!isLive(attempt) || !scribeRef.current) return
-
-    attempt.connected = true
-    try {
-      await scribeRef.current.connect({ token })
-      const connection = scribeRef.current.getConnection()
-      if (connection) {
-        const markAudioStarted = () => {
-          if (isLive(attempt) && attempt.audioStartedAt === null) attempt.audioStartedAt = Date.now()
-        }
-        connection.on(RealtimeEvents.AUDIO_STARTED, markAudioStarted)
-        attempt.detachAudioStarted = () => connection.off(RealtimeEvents.AUDIO_STARTED, markAudioStarted)
-      }
-    } catch (connectError) {
-      attempt.connected = false
-      failed(describeScribeError('other', connectError instanceof Error ? connectError.message : undefined))
-    }
-  }
-
-  const flushAndEnd = async (attempt: Attempt) => {
-    const scribe = scribeRef.current
-    if (scribe && attempt.connected && isLive(attempt)) {
-      try {
-        scribe.mute()
-      } catch {
-        // microphone not attached yet
-      }
-      try {
-        scribe.commit()
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, STOP_FLUSH_TIMEOUT_MS)
-          attempt.onCommit = () => {
-            clearTimeout(timer)
-            resolve()
-          }
-        })
-      } catch {
-        // socket already closed; endAttempt saves the partial
-      }
-    }
-    endAttempt(attempt, true)
-  }
-
-  /** Commit the current audio boundary without stopping the microphone (used by Smart ✓). */
-  const flushCurrent = async () => {
-    const attempt = attemptRef.current
-    const scribe = scribeRef.current
-    if (!attempt || !scribe || !attempt.connected || !isLive(attempt)) return
-    try {
-      scribe.commit()
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, STOP_FLUSH_TIMEOUT_MS)
-        attempt.onCommit = () => {
-          attempt.onCommit = null
-          clearTimeout(timer)
-          resolve()
-        }
+  /** Same path as the real hook: split by annotation interval and PDF page, then hand to the board. */
+  const save = useCallback(
+    (captured: Capture, text: string) => {
+      const clean = text.trim()
+      if (!clean) return
+      const endedAt = new Date().toISOString()
+      const { onFinal: emit, captureAnnotationIntervals: intervals, capturePageAt: pageAt } = opts.current
+      const parts = partitionTimestampedTranscript(clean, undefined, null, captured.startedAt, endedAt, intervals?.() ?? [], {
+        at: (ms) => pageAt?.(ms),
+        fallback: captured.context?.pageBlockId ?? null,
       })
-    } catch {
-      // The interval is already closed locally; the next VAD callback is still assigned by word time.
-    }
-  }
-
-  const requestStop = (): Promise<void> => {
-    shouldListenRef.current = false
-    clearRetry()
-    const attempt = attemptRef.current
-    if (!attempt) {
-      setListening(false)
-      setInterim('')
-      return Promise.resolve()
-    }
-    attempt.stopping ??= flushAndEnd(attempt)
-    return attempt.stopping
-  }
-
-  const hardStop = () => {
-    shouldListenRef.current = false
-    clearRetry()
-    const attempt = attemptRef.current
-    attemptRef.current = null
-    attempt?.onCommit?.()
-    scribeRef.current?.disconnect()
-  }
-
-  const events = {
-    sessionStarted() {
-      const attempt = attemptRef.current
-      if (!attempt || !isLive(attempt)) return
-      if (metricsStartedAtRef.current === null) metricsStartedAtRef.current = Date.now()
-      setListening(true)
-      setError(null)
-      refreshMetrics()
-    },
-    partial(text: string) {
-      const attempt = attemptRef.current
-      if (!attempt || !isLive(attempt)) return
-      retriesRef.current = 0
-      attempt.buffer.partial(text, capture)
-      setInterim(attempt.buffer.pendingText)
-    },
-    committed(text: string) {
-      const attempt = attemptRef.current
-      if (!attempt || !isLive(attempt)) return
-      retriesRef.current = 0
-      const utterance = attempt.buffer.commit(text, capture)
-      setInterim('')
-      if (utterance) attempt.pendingCommits.push(utterance.text, utterance)
-      else attempt.onCommit?.()
-    },
-    timestamped(text: string, words: WordTimestamp[] | undefined) {
-      const attempt = attemptRef.current
-      if (!attempt || !isLive(attempt)) return
-      const pending = attempt.pendingCommits.take(text)
-      if (!pending) return
-      saveParts(pending.capture, text, words)
-      // The SDK keeps every committed segment in state; the board already has them.
-      scribeRef.current?.clearTranscripts()
-      attempt.onCommit?.()
-    },
-    fail(kind: ScribeErrorKind, detail?: string) {
-      const attempt = attemptRef.current
-      if (!attempt || !isLive(attempt) || attempt.stopping) return
-      // The SDK reports a specific error first, then the same one again through onError.
-      if (kind === 'other' && attempt.failure) return
-      const failure = describeScribeError(kind, detail)
-      attempt.failure = failure
-      setError(failure.message)
-      if (failure.fatal) {
-        shouldListenRef.current = false
-        endAttempt(attempt, true)
+      for (const part of parts) {
+        const context = captured.context ? { ...captured.context, annotationId: part.annotationId, pageBlockId: part.pageBlockId } : null
+        emit(part.text, null, part.tStart, part.tEnd, context)
       }
+      const now = Date.now()
+      samples.current = [...samples.current, { completedAt: now, wordCount: countWords(clean), confidence: null }]
+      refreshMetrics(now)
     },
-    closed() {
-      const attempt = attemptRef.current
-      // Intentional stops clear the attempt first; an attempt still fetching its token isn't connected.
-      if (!attempt || !attempt.connected) return
-      const generation = attempt.generation
-      endAttempt(attempt, true)
-      if (!attempt.failure && shouldListenRef.current) setError('ElevenLabs connection closed. Reconnecting…')
-      scheduleReconnect(generation)
-    },
-  }
-  const eventsRef = useRef(events)
-  eventsRef.current = events
-  const stopRef = useRef(requestStop)
-  stopRef.current = requestStop
-  const flushRef = useRef(flushCurrent)
-  flushRef.current = flushCurrent
+    [refreshMetrics],
+  )
 
-  const callbacks = useMemo(() => {
-    const fail = (kind: ScribeErrorKind) => (data: { error: string }) => eventsRef.current.fail(kind, data.error)
-    return {
-      onSessionStarted: () => eventsRef.current.sessionStarted(),
-      onPartialTranscript: (data: { text: string }) => eventsRef.current.partial(data.text),
-      onCommittedTranscript: (data: { text: string }) => eventsRef.current.committed(data.text),
-      onCommittedTranscriptWithTimestamps: (data: { text: string; words?: WordTimestamp[] }) =>
-        eventsRef.current.timestamped(data.text, data.words),
-      onAuthError: fail('auth'),
-      onQuotaExceededError: fail('quota'),
-      onUnacceptedTermsError: fail('unaccepted_terms'),
-      onRateLimitedError: fail('rate_limited'),
-      onResourceExhaustedError: fail('resource_exhausted'),
-      onSessionTimeLimitExceededError: fail('session_time_limit'),
-      onInsufficientAudioActivityError: fail('insufficient_audio'),
-      onTranscriberError: fail('transcriber'),
-      onInputError: fail('input'),
-      onError: (err: Error | Event) => eventsRef.current.fail('other', err instanceof Error ? err.message : undefined),
-      onDisconnect: () => eventsRef.current.closed(),
-    }
-  }, [])
+  const capture = (): Capture => ({ context: opts.current.captureContext?.() ?? null, startedAt: new Date().toISOString() })
 
-  const scribe = useScribe({
-    modelId: SCRIBE_MODEL_ID,
-    commitStrategy: CommitStrategy.VAD,
-    languageCode: 'en',
-    keyterms: KEYTERMS,
-    microphone: MICROPHONE,
-    includeTimestamps: true,
-    ...callbacks,
-  })
-  scribeRef.current = scribe
-
-  const stop = useCallback(() => stopRef.current(), [])
-  const flush = useCallback(() => flushRef.current(), [])
-
-  useEffect(() => {
-    if (!listening) return
-    const timer = window.setInterval(refreshMetrics, 1_000)
-    return () => window.clearInterval(timer)
-  }, [listening, refreshMetrics])
-
-  // Layout cleanup invalidates old callbacks before passive-effect cleanup runs on a route change.
   useLayoutEffect(() => {
-    const generation = ++generationRef.current
-    samplesRef.current = []
-    metricsStartedAtRef.current = null
-    retriesRef.current = 0
+    samples.current = []
+    startedAt.current = null
     setInterim('')
     setListening(false)
     setError(null)
     setMetrics(EMPTY_METRICS)
-
-    return () => {
-      if (generationRef.current === generation) generationRef.current += 1
-    }
   }, [scopeKey])
 
   useEffect(() => {
+    if (!listening) return
+    const t = window.setInterval(refreshMetrics, 1_000)
+    return () => window.clearInterval(t)
+  }, [listening, refreshMetrics])
+
+  useEffect(() => {
     if (!enabled) {
-      shouldListenRef.current = false
-      clearRetry()
       setInterim('')
       setListening(false)
       return
     }
-    if (!supported) {
-      setError('ElevenLabs needs microphone access on a secure page (HTTPS or localhost) in a modern browser.')
-      return
-    }
-
-    const generation = generationRef.current
-    shouldListenRef.current = true
-    retriesRef.current = 0
+    let alive = true
+    if (startedAt.current === null) startedAt.current = Date.now()
     setError(null)
-    void begin(generation)
 
-    return () => {
-      const flushFinalResult = enabledRef.current === false && generationRef.current === generation
-      if (flushFinalResult) void requestStop()
-      else hardStop()
+    if (mode === 'mic' && micSupported()) {
+      // ------------------------------------------------ browser speech recognition
+      const rec = createRecognition()!
+      rec.continuous = true
+      rec.interimResults = true
+      rec.lang = 'en-US'
+      let current: Capture | null = null
+      let pending = ''
+      rec.onstart = () => alive && setListening(true)
+      rec.onresult = (e) => {
+        let partial = ''
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const r = e.results[i]
+          current ??= capture()
+          if (r.isFinal) {
+            save(current, r[0].transcript)
+            current = null
+          } else partial += r[0].transcript
+        }
+        pending = partial
+        setInterim(partial)
+      }
+      rec.onerror = (e) => {
+        if (e.error === 'no-speech' || e.error === 'aborted') return
+        alive = false
+        setListening(false)
+        setError(
+          e.error === 'not-allowed' || e.error === 'service-not-allowed'
+            ? 'The browser blocked the microphone. Allow it for this site, or switch the demo voice to the sample lecture.'
+            : `Speech recognition stopped (${e.error}). Turn recording off and on, or use the sample lecture.`,
+        )
+      }
+      // Browsers end recognition after a silence: keep it going while recording is on.
+      rec.onend = () => {
+        if (alive) {
+          try {
+            rec.start()
+          } catch {
+            /* already restarting */
+          }
+        }
+      }
+      flushRef.current = () => {
+        if (current && pending) save(current, pending)
+        current = null
+        pending = ''
+        setInterim('')
+      }
+      stopRef.current = () => {
+        alive = false
+        flushRef.current()
+        rec.abort()
+        setListening(false)
+      }
+      try {
+        rec.start()
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Couldn’t start speech recognition.')
+      }
+      return () => stopRef.current()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, scopeKey, supported])
 
-  return { interim, listening, supported, error, metrics, confidenceSupported: false, stop, flush }
+    // ------------------------------------------------ sample lecture, word by word
+    const session = getData().sessions.find((s) => s.id === sessionId)
+    const lecture = getData().lectures.find((l) => l.id === session?.lecture_id)
+    const lines = scriptFor(String(session?.title ?? lecture?.title ?? ''))
+    const progressKey = `aside-demo-line:${sessionId}`
+    const remember = (n: number) => {
+      try {
+        sessionStorage.setItem(progressKey, String(n))
+      } catch {
+        /* private mode */
+      }
+    }
+    let line = 0
+    try {
+      line = Number(sessionStorage.getItem(progressKey) ?? 0) || 0
+    } catch {
+      /* private mode */
+    }
+    let circles = 0
+    let lastAnn: string | null = null
+    let annSentence = 0
+    let timer: number | undefined
+    let current: Capture | null = null
+    let words: string[] = []
+    let said = 0
+
+    const nextSentence = () => {
+      if (!alive) return
+      current = capture()
+      const annId = current.context?.annotationId
+      if (annId) {
+        // A lasso is open: talk about the circled image.
+        const ann = getData().annotations.find((a) => a.id === annId)
+        const block = getData().blocks.find((b) => b.id === ann?.block_id)
+        const asset = getData().assets.find((a) => a.id === block?.asset_id)
+        if (annId !== lastAnn) {
+          if (lastAnn !== null) circles += 1
+          lastAnn = annId
+          annSentence = 0
+        }
+        words = annotationLine((asset?.key_terms as string[] | null) ?? [], circles, annSentence++).split(' ')
+      } else if (line < lines.length) {
+        words = lines[line].split(' ')
+        line += 1
+        remember(line)
+      } else {
+        // The sample lecture is over: stay quiet (recording stays on), but keep answering new circles.
+        current = null
+        setInterim('')
+        timer = window.setTimeout(nextSentence, 1_000)
+        return
+      }
+      said = 0
+      speak()
+    }
+    const speak = () => {
+      if (!alive) return
+      said += 1
+      setInterim(words.slice(0, said).join(' '))
+      if (said < words.length) timer = window.setTimeout(speak, WORD_MS + Math.random() * 120)
+      else timer = window.setTimeout(commit, 350)
+    }
+    const commit = () => {
+      if (!alive || !current) return
+      save(current, words.slice(0, said).join(' '))
+      current = null
+      setInterim('')
+      timer = window.setTimeout(nextSentence, PAUSE_MS)
+    }
+    flushRef.current = () => {
+      if (!current || said === 0) return
+      window.clearTimeout(timer)
+      save(current, words.join(' '))
+      current = null
+      setInterim('')
+      if (alive) timer = window.setTimeout(nextSentence, PAUSE_MS)
+    }
+    stopRef.current = () => {
+      if (current && said >= 3) save(current, words.slice(0, said).join(' '))
+      current = null
+      alive = false
+      window.clearTimeout(timer)
+      setInterim('')
+      setListening(false)
+    }
+    setListening(true)
+    timer = window.setTimeout(nextSentence, 600)
+    return () => stopRef.current()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, scopeKey, mode, sessionId, save])
+
+  const stop = useCallback(async () => {
+    stopRef.current()
+  }, [])
+  const flush = useCallback(async () => {
+    flushRef.current()
+  }, [])
+
+  return { interim, listening, supported: true, error, metrics, confidenceSupported: false, stop, flush }
 }

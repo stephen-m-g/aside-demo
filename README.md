@@ -15,6 +15,9 @@ An accessible teaching workspace that turns spoken explanations, lecture materia
 
 ---
 
+> **You're on the `demo` branch.** This is the keyless interactive demo: the full UI running entirely in the browser, with sample content and simulated AI. The real app lives on `main`. See [docs/DEMO.md](docs/DEMO.md).
+
+
 ## Demo
 
 https://github.com/user-attachments/assets/ab2ca793-f133-4b30-98f4-c3ff96e19b6d
