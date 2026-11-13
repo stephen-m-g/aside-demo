@@ -6,14 +6,15 @@ The `demo` branch is the public, keyless version of aside: the full web UI with 
 
 ## What's different from `main`
 
-Only four app files change; every screen and component is the same code as `main`.
+Only five app files change; every other screen and component is the same code as `main`.
 
 | File | On `main` | On `demo` |
 |---|---|---|
 | `web/src/lib/supabase.ts` | Supabase client from env vars | In-browser stand-in (`src/demo/db.ts`), typed as the real client |
 | `web/src/lib/api.ts` | `fetch` to the FastAPI server | Same functions, run in the browser (`src/demo/ai.ts`) |
 | `web/src/hooks/useScribeTranscription.ts` | ElevenLabs Scribe (server-minted token) | Sample-lecture voice, or the browser's built-in speech recognition |
-| `web/src/main.tsx` | Renders the app | Loads/seeds demo data first, adds the demo bar |
+| `web/src/main.tsx` | Renders the app | Loads/seeds demo data first, adds the demo badge |
+| `web/src/pages/Dashboard.tsx` | Logo in the header | Logo plus a slot for the Demo badge (`#demo-badge-slot`) |
 
 Everything else that's demo-only lives in `web/src/demo/` and `web/public/demo/`.
 
@@ -21,10 +22,10 @@ Everything else that's demo-only lives in `web/src/demo/` and `web/public/demo/`
 - **`ai.ts`**: the API endpoints (`describe`, `pages`, `refine`, `close`, `compile`), writing the same rows the server writes. Simple rules stand in for Gemini (`language.ts`: filler removal, a biology glossary for key terms and labels); pdf.js renders uploaded PDFs to page images locally.
 - **`seed.ts`**: what a first-time visitor sees: three lectures, an archived one, three classes, and two recorded sessions with boards, ink, a smart annotation, transcripts and study notes. Bump `SEED_VERSION` when it changes so visitors get the new content.
 - **`scripts.ts`** / **`voice.ts`**: the sample lectures and the voice picker.
-- **`DemoBar.tsx`**: the floating bar (guide, voice picker on the Teach screen, reset).
+- **`DemoBar.tsx`**: the Demo badge (next to the logo on the dashboard, floating elsewhere; hover or tap for Guide and Reset), the voice picker on the Teach screen, and the guide.
 - **`web/public/demo/*.svg`**: original diagrams used by the seed.
 
-Each visitor gets their own copy of the demo in their browser; nobody sees anyone else's changes. **Reset** in the demo bar restores the seed.
+Each visitor gets their own copy of the demo in their browser; nobody sees anyone else's changes. **Reset** (hover the Demo badge) restores the seed.
 
 ## Run it
 
@@ -51,4 +52,4 @@ git switch demo
 git merge main
 ```
 
-Conflicts can only happen in the four files in the table above; keep the demo version of each. If `main` starts using a new Supabase feature (a new table, filter or column), add it to `src/demo/db.ts` (`TABLES`, `FKS`) and the seed.
+Conflicts can only happen in the files in the table above. Keep the demo version of the first four; in `Dashboard.tsx` take `main`'s changes and keep the `demo-brand` wrapper and `#demo-badge-slot` around the logo. If `main` starts using a new Supabase feature (a new table, filter or column), add it to `src/demo/db.ts` (`TABLES`, `FKS`) and the seed.

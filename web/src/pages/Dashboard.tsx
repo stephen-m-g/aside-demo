@@ -268,9 +268,13 @@ export default function Dashboard() {
     <div className="dash bento-page" ref={rootRef}>
       <div className="bento-inner">
         <header className="bento-header">
-          <h1 className="dash-title dash-logo">
-            <img src="/aside-logo.png" alt="aside" width={1065} height={321} />
-          </h1>
+          <div className="demo-brand">
+            <h1 className="dash-title dash-logo">
+              <img src="/aside-logo.png" alt="aside" width={1065} height={321} />
+            </h1>
+            {/* Demo build: the demo badge mounts here (src/demo/DemoBar.tsx). */}
+            <div id="demo-badge-slot" />
+          </div>
           <button
             className="dash-btn solid new-lecture"
             disabled={busy || !supabaseConfigured}
